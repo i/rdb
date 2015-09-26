@@ -1,9 +1,12 @@
 ## rdb
+
 Rdb is an extremely fast, key-value database insprised by bitcask.
 
+Godoc: https://godoc.org/github.com/i/rdb
+
 #### Features
-1. Replaying
-1. doing ocol
+1. Continuous snapshots (you can replay database from any point in time)
+1. TODO
 
 #### Operations
 ```lang=golang
@@ -13,4 +16,3 @@ Delete(key string)
 Keys()
 ```
 
-Godoc: https://godoc.org/github.com/i/rdb
