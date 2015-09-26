@@ -1,11 +1,15 @@
 package rdb
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
+	"sort"
 	"sync"
 	"time"
 )
@@ -19,6 +23,7 @@ const MetaSize = 150
 type DB interface {
 	Set(string, interface{}) error
 	Get(string) (interface{}, error)
+	Key(bool) []MetaInfo
 }
 
 type db struct {
@@ -29,23 +34,27 @@ type db struct {
 	m        sync.Mutex
 }
 
-func NewDB(dirpath string) DB {
+func NewDB(dirpath string) (DB, error) {
 	db := &db{
 		metaKeys: make(map[string]MetaInfo),
 		files:    make(map[string]*os.File),
 		dirpath:  dirpath,
 	}
-	db.replay()
-	db.setCf()
-	return db
+	if err := db.replay(); err != nil {
+		return nil, err
+	}
+	if err := db.setCf(); err != nil {
+		return nil, err
+	}
+	return db, nil
 }
 
 type MetaInfo struct {
+	Key    string
 	Ts     time.Time
 	Path   string
 	Offset int64
 	VSize  int
-	MSize  int
 }
 
 func (d *db) Set(key string, v interface{}) error {
@@ -66,11 +75,11 @@ func (d *db) Set(key string, v interface{}) error {
 	}
 
 	meta := MetaInfo{
+		Key:    key,
 		Ts:     time.Now(),
 		Path:   path.Join(d.cf.Name()),
 		Offset: offset,
 		VSize:  len(vbuf),
-		MSize:  MetaSize,
 	}
 
 	mbuf, err := newMetaBuffer(meta)
@@ -88,17 +97,6 @@ func (d *db) Set(key string, v interface{}) error {
 	return nil
 }
 
-func newMetaBuffer(meta MetaInfo) ([]byte, error) {
-	buf := make([]byte, MetaSize)
-	m, err := json.Marshal(meta)
-	if err != nil {
-		return nil, err
-	}
-	for i, b := range m {
-		buf[i] = b
-	}
-	return buf, nil
-}
 func (d *db) Get(key string) (interface{}, error) {
 	meta, ok := d.metaKeys[key]
 	if !ok {
@@ -113,27 +111,59 @@ func (d *db) Get(key string) (interface{}, error) {
 		}
 		file = f
 	}
-
-	buf := make([]byte, meta.VSize)
-	_, err := file.ReadAt(buf, meta.Offset+MetaSize)
-	if err != nil {
-		return nil, err
-	}
-
-	var v interface{}
-	if err := json.Unmarshal(buf, &v); err != nil {
-		return nil, err
-	}
-
-	return v, nil
+	return readValue(meta, file)
 }
 
-func (d *db) replay() {
-	// todo
-	// read all files in d.dirname
-	// sort them// for each file:
-	// 	 read meta
-	//   load meta into metakeys
+func (d *db) Keys() []string {
+	var keys []string
+	for k, _ := range d.metaKeys {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func (d *db) replay() error {
+	f, err := os.Open(d.dirpath)
+	if err != nil {
+		return err
+	}
+
+	names, err := f.Readdirnames(0)
+	if err != nil {
+		return err
+	}
+
+	sort.Strings(names)
+	for _, name := range names {
+		if err := d.loadFile(path.Join(d.dirpath, name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *db) loadFile(name string) error {
+	var offset int64
+	var meta MetaInfo
+
+	f, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for {
+		meta, offset, err = metaFromOffset(f, offset)
+		fmt.Println(meta, offset, err)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		d.metaKeys[meta.Key] = meta
+	}
+
+	return nil
 }
 
 func (d *db) setCf() error {
@@ -145,4 +175,62 @@ func (d *db) setCf() error {
 	d.files[p] = cf
 	d.cf = cf
 	return nil
+}
+
+func newMetaBuffer(meta MetaInfo) ([]byte, error) {
+	buf := make([]byte, 5)
+	mbuf, err := json.Marshal(meta)
+	if err != nil {
+		return nil, err
+	}
+	n := binary.PutVarint(buf, int64(len(mbuf)))
+	b := bytes.NewBuffer(buf)
+	b.Truncate(n)
+	b.Write(mbuf)
+	return b.Bytes(), nil
+}
+
+func metaFromOffset(file *os.File, offset int64) (MetaInfo, int64, error) {
+	var info MetaInfo
+	buf := make([]byte, 5) // todo
+	if _, err := file.ReadAt(buf, offset); err != nil {
+		return info, 0, err
+	}
+
+	// Calculate offset for actual value
+	msize, err := binary.ReadVarint(bytes.NewBuffer(buf))
+	if err != nil {
+		return info, 0, err
+	}
+	vOffset := msize + 2
+	buf = make([]byte, msize)
+	if _, err := file.ReadAt(buf, offset+2); err != nil {
+		return info, 0, err
+	}
+	json.Unmarshal(buf, &info)
+	return info, vOffset, err
+}
+
+func readValue(meta MetaInfo, file *os.File) (interface{}, error) {
+	buf := make([]byte, 5) // todo
+	if _, err := file.ReadAt(buf, meta.Offset); err != nil {
+		return nil, err
+	}
+
+	// Calculate offset for actual value
+	vOffset, err := binary.ReadVarint(bytes.NewBuffer(buf))
+	if err != nil {
+		return nil, err
+	}
+	vOffset += 2
+
+	buf = make([]byte, meta.VSize)
+	if _, err := file.ReadAt(buf, meta.Offset+vOffset); err != nil {
+		return nil, err
+	}
+	fmt.Println(buf)
+
+	var v interface{}
+	err = json.Unmarshal(buf, &v)
+	return v, err
 }
